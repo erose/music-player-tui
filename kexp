@@ -1,0 +1,4 @@
+#!/bin/sh
+# Launcher: runs the player from its own venv regardless of cwd.
+cd "$(dirname "$0")" || exit 1
+exec .venv/bin/python -m player "$@"
