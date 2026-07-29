@@ -329,7 +329,7 @@ class MusicPlayer(App):
         if not track.available:
             return
         try:
-            self.backend.preload(self.library.presign(track.key))
+            self.backend.preload(self.library.url(track.key))
         except Exception:
             pass  # preloading is an optimisation; failing it costs only latency
 
@@ -342,9 +342,9 @@ class MusicPlayer(App):
             return
 
         try:
-            url = self.library.presign(track.key)
+            url = self.library.url(track.key)
         except Exception as exc:
-            self._on_error(f"Could not sign {track.filename}: {exc}")
+            self._on_error(f"Could not build URL for {track.filename}: {exc}")
             return
 
         self.playing_day = day

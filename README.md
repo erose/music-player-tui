@@ -3,9 +3,11 @@
 A terminal player for the KEXP Morning Show rolling downloads in
 `s3://elis-music/kexp-morning-show-rolling-downloads`.
 
-**Nothing is downloaded.** Each track is played from a presigned HTTPS URL that
-`mpg123` decodes with range requests, straight to the audio device. The only
-objects ever fetched are the few-KB `playlist.json` files.
+**No AWS credentials needed** — the bucket is public, so the listing and the
+audio are ordinary unauthenticated HTTPS requests. **Nothing is downloaded**
+either: `mpg123` decodes each track from its URL with range requests, straight
+to the audio device. The only objects ever fetched are the few-KB
+`playlist.json` files.
 
 ## Run
 
@@ -39,14 +41,16 @@ you'd arrowed off to browse.
 ## How it works
 
 ```
-S3 ──presigned HTTPS──► mpg123 -R ──PCM──► CoreAudio
- ▲                          ▲ │
- │ boto3: list, playlist    │ │ commands / @F status
- └────── player/ (Textual) ─┘◄┘
+public bucket ──HTTPS──► mpg123 -R ──PCM──► CoreAudio
+ ▲                           ▲ │
+ │ urllib: list, playlist    │ │ commands / @F status
+ └────── player/ (Textual) ──┘◄┘
 ```
 
-- `player/library.py` — one paginated listing of the prefix gives every date
-  folder and its track count in a single pass; `playlist.json` supplies artist,
+- `player/library.py` — plain HTTPS against the public bucket using only the
+  standard library: `urllib` plus `ElementTree` to parse the `ListObjectsV2`
+  XML, including continuation-token pagination. One listing of the prefix gives
+  every date folder and its track count in a single pass; `playlist.json` supplies artist,
   song, album and airdate, with a filename-parsing fallback if it's absent.
   Entries listed in the playlist but missing from the bucket are shown struck
   through rather than failing at play time.
@@ -82,10 +86,11 @@ S3 ──presigned HTTPS──► mpg123 -R ──PCM──► CoreAudio
   the playing track, i.e. you're just listening — the *next* track, so
   auto-advance is gapless too. `backend.warm_starts` / `cold_starts` count which
   path each start took.
-- **Presigned URLs are cached per key.** `generate_presigned_url` returns a
-  fresh signature every call, so re-signing at play time would never match the
-  URL the standby was warmed with and every switch would silently take the slow
-  path. URLs are reused until they near expiry.
+- **URLs are stable by construction**, which the warm standby depends on: it
+  matches its preloaded stream by URL, so a URL that varied between preload and
+  play would silently never match and every switch would take the slow path.
+  (This was a real bug back when these were presigned — `generate_presigned_url`
+  returns a fresh signature on every call.)
 - **Pause latency is bounded by the audio device buffer.** mpg123's decode loop
   blocks writing to CoreAudio and only services stdin once per buffer, so with
   the default buffer `PAUSE` took ~390ms to take effect. `--devbuffer 0.05`
@@ -103,8 +108,11 @@ S3 ──presigned HTTPS──► mpg123 -R ──PCM──► CoreAudio
   The recompute listens to `TrackTable.Resized` rather than the app's own
   `Resize`: the latter fires before the table is re-laid-out, which leaves the
   columns sized for the *previous* terminal width.
-- **Presigned URLs last 6 hours**, minted at play time, so a track left paused
-  still resumes.
+- **The bucket's public access is bucket-wide, not scoped to this prefix.** The
+  policy allows `s3:GetObject` on `arn:aws:s3:::elis-music/*`, and the bucket
+  ACL grants `AllUsers: READ`, which is what makes anonymous listing work.
+  Anonymous writes are refused (403). If the bucket is ever made private this
+  player stops working and would need signing put back.
 - Duplicate playlist entries are preserved — on 2026-07-28 the Pixies genuinely
   aired twice, at 8:11 and 8:14.
 
@@ -115,6 +123,5 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-`botocore[crt]` is required because this account authenticates with the `aws
-login` credential provider, which botocore only supports with that extra.
-`mpg123` must be on `PATH` (`brew install mpg123`).
+`textual` is the only dependency; everything else is standard library. `mpg123`
+must be on `PATH` (`brew install mpg123`).

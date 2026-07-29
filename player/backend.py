@@ -8,8 +8,8 @@ mpg123's remote mode is a line protocol on stdin/stdout. We send commands
     @P <0|1|2|3>                stopped | paused | playing | end-of-track
     @E <message>                error
 
-It decodes straight from an HTTPS URL with range requests, so audio never
-touches disk, and @F gives real elapsed/remaining seconds rather than a
+It decodes straight from a public HTTPS URL with range requests, so audio
+never touches disk, and @F gives real elapsed/remaining seconds rather than a
 wall-clock estimate.
 
 Why two processes: switching a single process to a new URL costs ~285ms of
@@ -84,7 +84,7 @@ class _Stream:
 
     def load(self, url: str) -> None:
         """Open and start playing. LOAD reads to end of line, so the URL must
-        be percent-encoded — which is what boto3's presigner produces."""
+        be percent-encoded — see Library.url()."""
         self.url, self.ready, self._preloading = url, False, False
         self.position = self.duration = 0.0
         self._send(f"LOAD {url}")

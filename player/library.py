@@ -1,28 +1,29 @@
-"""S3 access: discover dates, load playlists, mint presigned URLs.
+"""Bucket access over plain HTTPS — no credentials, no SDK.
 
-Nothing here downloads audio. The only objects fetched are playlist.json
-files (a few KB); mp3s are only ever referenced by presigned URL.
+The bucket is public: its policy allows s3:GetObject to everyone, and its ACL
+grants AllUsers READ, which is what permits anonymous listing. So both the
+listing and the audio are ordinary unauthenticated HTTPS requests, and the
+player works whether or not you are logged into AWS.
+
+Nothing here downloads audio. The only objects fetched are playlist.json files
+(a few KB); mp3s are only ever referenced by URL.
 """
 
 from __future__ import annotations
 
 import json
-import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass, field
-
-import boto3
-from botocore.exceptions import ClientError
 
 BUCKET = "elis-music"
 PREFIX = "kexp-morning-show-rolling-downloads"
 REGION = "us-east-2"
 
-# Presigned URLs are minted at play time. Tracks run a few minutes, but a
-# generous window means a paused track can sit untouched and still resume.
-URL_TTL_SECONDS = 6 * 60 * 60
-# Re-sign once a cached URL has less than this left, so a long-paused track
-# never resumes against an expired signature.
-URL_REFRESH_MARGIN = 15 * 60
+S3_NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+TIMEOUT = 20
 
 
 @dataclass
@@ -57,10 +58,21 @@ class Day:
 
 class Library:
     def __init__(self, bucket: str = BUCKET, prefix: str = PREFIX, region: str = REGION):
-        self.bucket = bucket
         self.prefix = prefix.rstrip("/")
-        self.client = boto3.client("s3", region_name=region)
-        self._signed: dict[str, tuple[str, float]] = {}
+        self.endpoint = f"https://{bucket}.s3.{region}.amazonaws.com"
+
+    def url(self, key: str) -> str:
+        """Public URL for a key.
+
+        Percent-encoded, because these filenames contain spaces, apostrophes
+        and curly quotes — and because mpg123's LOAD command reads to the end
+        of the line, so a raw space would truncate the URL.
+        """
+        return f"{self.endpoint}/{urllib.parse.quote(key)}"
+
+    def _get(self, url: str) -> bytes:
+        with urllib.request.urlopen(url, timeout=TIMEOUT) as response:
+            return response.read()
 
     def list_days(self) -> list[Day]:
         """One paginated listing of the whole prefix, grouped by date folder.
@@ -69,10 +81,16 @@ class Library:
         us the track counts for the date picker in the same pass.
         """
         days: dict[str, Day] = {}
-        paginator = self.client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=f"{self.prefix}/"):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
+        token: str | None = None
+        while True:
+            params = {"list-type": "2", "prefix": f"{self.prefix}/"}
+            if token:
+                params["continuation-token"] = token
+            root = ElementTree.fromstring(
+                self._get(f"{self.endpoint}/?{urllib.parse.urlencode(params)}")
+            )
+            for contents in root.findall(f"{S3_NS}Contents"):
+                key = contents.findtext(f"{S3_NS}Key", "")
                 rest = key[len(self.prefix) + 1 :]
                 if "/" not in rest:
                     continue
@@ -80,6 +98,13 @@ class Library:
                 day = days.setdefault(date, Day(date=date, prefix=f"{self.prefix}/{date}"))
                 if name.lower().endswith(".mp3"):
                     day.mp3_keys.append(key)
+
+            if root.findtext(f"{S3_NS}IsTruncated") != "true":
+                break
+            token = root.findtext(f"{S3_NS}NextContinuationToken")
+            if not token:
+                break
+
         return sorted(days.values(), key=lambda d: d.date, reverse=True)
 
     def load_day(self, day: Day) -> Day:
@@ -132,30 +157,10 @@ class Library:
 
     def _fetch_playlist(self, day: Day) -> dict | None:
         try:
-            resp = self.client.get_object(Bucket=self.bucket, Key=f"{day.prefix}/playlist.json")
-        except ClientError:
+            body = self._get(self.url(f"{day.prefix}/playlist.json"))
+        except (urllib.error.URLError, OSError):
             return None
         try:
-            return json.loads(resp["Body"].read())
-        except (ValueError, KeyError):
+            return json.loads(body)
+        except ValueError:
             return None
-
-    def presign(self, key: str) -> str:
-        """Signed URL for a key, stable until it nears expiry.
-
-        Each call to generate_presigned_url produces a fresh signature, so
-        signing the same track twice yields two different URLs. The backend
-        matches its preloaded stream by URL, so re-signing at play time would
-        never match what was warmed and every switch would take the slow path.
-        """
-        now = time.monotonic()
-        cached = self._signed.get(key)
-        if cached is not None and cached[1] - now > URL_REFRESH_MARGIN:
-            return cached[0]
-        url = self.client.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": self.bucket, "Key": key},
-            ExpiresIn=URL_TTL_SECONDS,
-        )
-        self._signed[key] = (url, now + URL_TTL_SECONDS)
-        return url
