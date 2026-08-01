@@ -1,4 +1,4 @@
-# kexp-player
+# player
 
 A terminal player for the KEXP Morning Show rolling downloads in
 `s3://elis-music/kexp-morning-show-rolling-downloads`.
@@ -12,7 +12,7 @@ to the audio device. The only objects ever fetched are the few-KB
 ## Run
 
 ```sh
-./kexp
+./play
 ```
 
 ## Keys
@@ -85,9 +85,9 @@ public bucket ──HTTPS──► mpg123 -R ──PCM──► CoreAudio
   fault gauge rather than a success tally. Note the check needs the duration
   estimate to be trustworthy: measured at the real end of a track, `@F`
   reported 0.03s remaining, against an `END_TOLERANCE` of 5s.
-- **`KEXP_LOG=/tmp/kexp.log` records every command and reply**, per
+- **`PLAYER_LOG=/tmp/player.log` records every command and reply**, per
   process, with timestamps — `A >> LOAD ...`, `A << @P 3`, plus the decisions
-  the backend makes. Add `KEXP_LOG_FRAMES=1` to keep `@F` too, which arrives
+  the backend makes. Add `PLAYER_LOG_FRAMES=1` to keep `@F` too, which arrives
   ~40x a second. Off by default. Playback faults happen minutes apart and
   depend on the network, so reconstructing one after the fact beats trying to
   catch it live.

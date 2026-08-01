@@ -17,8 +17,8 @@ RUST = "#C4541F"  # the playing track — "what is playing"
 PARCHMENT = "#E6DFD5"
 MUTED = "#8A7F73"
 
-KEXP_THEME = Theme(
-    name="kexp",
+PLAYER_THEME = Theme(
+    name="player",
     primary=AMBER,
     secondary=RUST,
     accent=AMBER,

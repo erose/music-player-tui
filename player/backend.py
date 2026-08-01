@@ -67,11 +67,11 @@ class BackendMissing(RuntimeError):
 
 
 # Playback failures are timing-dependent and happen minutes apart, which makes
-# them hard to catch in the act. Set KEXP_LOG to a path to record every
-# command and reply, per process, with timestamps; KEXP_LOG_FRAMES=1 also
+# them hard to catch in the act. Set PLAYER_LOG to a path to record every
+# command and reply, per process, with timestamps; PLAYER_LOG_FRAMES=1 also
 # keeps @F, which arrives ~40x a second. Off by default, near-free when off.
-_LOG_PATH = os.environ.get("KEXP_LOG")
-_LOG_FRAMES = os.environ.get("KEXP_LOG_FRAMES") == "1"
+_LOG_PATH = os.environ.get("PLAYER_LOG")
+_LOG_FRAMES = os.environ.get("PLAYER_LOG_FRAMES") == "1"
 _log_lock = threading.Lock()
 _log_file = None
 

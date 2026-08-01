@@ -12,7 +12,7 @@ from textual.widgets import DataTable, Footer, Header, Label, ListItem, ListView
 
 from .backend import FINISHED, PAUSED, PLAYING, STOPPED, BackendMissing, Mpg123
 from .library import Day, Library, Track
-from .theme import AMBER, KEXP_THEME, MUTED, RUST
+from .theme import AMBER, PLAYER_THEME, MUTED, RUST
 
 def format_time(seconds: float) -> str:
     seconds = max(0, int(seconds))
@@ -186,8 +186,8 @@ class MusicPlayer(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.register_theme(KEXP_THEME)
-        self.theme = KEXP_THEME.name
+        self.register_theme(PLAYER_THEME)
+        self.theme = PLAYER_THEME.name
 
         table = self.query_one("#tracks", TrackTable)
         table.cursor_type = "row"
