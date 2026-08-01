@@ -1,0 +1,64 @@
+name: Daily Morning Show archive
+
+# Runs after the show has aired and been logged. 20:00 UTC = 12:00 PST / 13:00 PDT.
+# Cron is always UTC, so this drifts an hour with DST but stays comfortably after
+# the ~10:00 Pacific end of the show either way.
+on:
+  schedule:
+    - cron: "0 20 * * *"
+  workflow_dispatch: {}        # allow manual runs from the Actions tab
+
+# OIDC: lets configure-aws-credentials mint short-lived creds from an IAM role,
+# so there are NO long-lived AWS keys stored in the repo.
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest      # ffmpeg is NOT preinstalled here — installed in a step below
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Show tool versions
+        run: |
+          python3 --version
+          ffmpeg -version | head -n 1   # informational; the install step above is the real guard
+
+      # Archive rip (reliable from CI). YouTube is bot-blocked on GitHub's
+      # datacenter IPs, so --youtube fails here; --archive slices from KEXP's
+      # broadcast with lead/tail padding so songs aren't clipped.
+      - name: Rip the latest Morning Show from the KEXP archive
+        run: python3 morning_show_playlist.py --archive --latest
+
+      # NOTE: this account's GitHub OIDC tokens carry a CUSTOM subject (`sub`) claim
+      # that embeds immutable numeric owner/repo IDs, e.g.
+      #   repo:erose@1514487/music-player-tui@1316492211:ref:refs/heads/main
+      # (not the default `repo:erose/music-player-tui:...`). So the IAM role's trust
+      # policy must match that form — StringLike
+      #   "repo:erose@1514487/music-player-tui@1316492211:*"
+      # or assume-role fails with "Not authorized to perform sts:AssumeRoleWithWebIdentity".
+      # Confirmed via CloudTrail 2026-07-29. The numeric repo ID is per-repo, so
+      # moving the ripper here from erose/kexp-downloader (@1315634626) required
+      # re-pointing the trust policy as well as re-creating the secret and vars.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload to S3 (date-partitioned)
+        run: |
+          DATE=$(python3 -c "import json; print(json.load(open('downloads/playlist.json'))['date'])")
+          echo "Uploading show for $DATE"
+          aws s3 sync downloads/ "s3://${{ vars.S3_BUCKET }}/${{ vars.S3_PREFIX }}/${DATE}/" --no-progress
+          echo "Done: s3://${{ vars.S3_BUCKET }}/${{ vars.S3_PREFIX }}/${DATE}/"
