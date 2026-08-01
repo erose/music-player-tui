@@ -1,13 +1,32 @@
 # player
 
-A terminal player for the KEXP Morning Show rolling downloads in
-`s3://elis-music/kexp-morning-show-rolling-downloads`.
+KEXP's Morning Show, on a rolling two-week window, in the terminal. Two halves
+that meet at one S3 prefix:
 
-**No AWS credentials needed** — the bucket is public, so the listing and the
-audio are ordinary unauthenticated HTTPS requests. **Nothing is downloaded**
-either: `mpg123` decodes each track from its URL with range requests, straight
-to the audio device. The only objects ever fetched are the few-KB
-`playlist.json` files.
+```
+KEXP archive ──► morning_show_playlist.py ──► s3://elis-music/kexp-morning-show-rolling-downloads
+   (rip)          nightly, GitHub Actions                    │
+                                                             ▼
+                                                    player/ (Textual TUI)
+                                                          (listen)
+```
+
+- **The ripper** — `morning_show_playlist.py`, run nightly by
+  `.github/workflows/daily-archive.yml`, slices each song out of KEXP's own
+  broadcast archive and uploads a date-partitioned folder plus a
+  `playlist.json` manifest.
+- **The player** — `player/`, described below, reads that prefix and streams
+  from it.
+
+They were separate repos until the ripper moved here; nothing about the S3
+layout changed in the move.
+
+**The player needs no AWS credentials** — the bucket is public, so the listing
+and the audio are ordinary unauthenticated HTTPS requests. **Nothing is
+downloaded** either: `mpg123` decodes each track from its URL with range
+requests, straight to the audio device. The only objects ever fetched are the
+few-KB `playlist.json` files. (The *ripper* does need credentials, but only in
+CI, and mints them per-run via OIDC — see below.)
 
 ## Run
 
@@ -154,6 +173,65 @@ public bucket ──HTTPS──► mpg123 -R ──PCM──► CoreAudio
 - Duplicate playlist entries are preserved — on 2026-07-28 the Pixies genuinely
   aired twice, at 8:11 and 8:14.
 
+## The ripper
+
+`morning_show_playlist.py` finds a Morning Show airing via KEXP's public API
+and pulls the tracks it logged. Stdlib only; `ffmpeg` must be on `PATH`.
+
+```sh
+python3 morning_show_playlist.py                     # today's playlist, printed
+python3 morning_show_playlist.py 2026-06-22          # a specific date
+python3 morning_show_playlist.py --csv               # CSV instead of a list
+python3 morning_show_playlist.py --archive --latest  # rip the newest airing (what CI runs)
+python3 morning_show_playlist.py --youtube           # studio tracks off YouTube instead
+```
+
+Output lands in `downloads/` as `Artist - Song.mp3` alongside `playlist.json`.
+Both are gitignored.
+
+- **`--archive` slices the actual broadcast**, mapping each logged airdate to
+  an offset in KEXP's ~2-week streaming archive and cutting with ffmpeg. Always
+  the right recording, but it's live radio: intros and outros can carry DJ
+  voiceover, and the logged airdate is approximate, so there's lead/tail
+  padding to keep songs from clipping. Only works inside the archive window.
+- **`--youtube` gets clean studio tracks** from the top search hit, and is
+  strict — any track that fails to download exits non-zero. It does *not* work
+  on CI: YouTube bot-blocks GitHub's datacenter IPs. That's why the nightly job
+  uses `--archive`.
+- **`--latest` beats "today"** for unattended runs, which is why the cron uses
+  it: it takes the newest airing already in the past, so weekends, holidays and
+  preemptions don't produce an empty or failed rip.
+
+### The nightly job
+
+`.github/workflows/daily-archive.yml` runs at 20:00 UTC — noon PST / 1pm PDT,
+comfortably after the show ends around 10:00 Pacific either way, since cron is
+always UTC and drifts an hour with DST. `workflow_dispatch` is enabled, so you
+can also trigger it by hand from the Actions tab.
+
+There are **no long-lived AWS keys in the repo**. The job mints short-lived
+credentials from IAM role `kexp-archive-uploader` via GitHub's OIDC provider.
+What that setup depends on, all of it per-repo:
+
+| | |
+|---|---|
+| secret `AWS_ROLE_ARN` | the role to assume |
+| vars `AWS_REGION`, `S3_BUCKET`, `S3_PREFIX` | where the upload goes |
+| the role's trust policy | must name *this* repo (see below) |
+
+- **The trust policy pins numeric IDs, not the repo name.** This account's OIDC
+  tokens carry a custom `sub` claim embedding immutable owner and repo IDs —
+  `repo:erose@1514487/music-player-tui@1316492211:ref:refs/heads/main`, not the
+  default `repo:erose/music-player-tui:...`. The policy has to `StringLike`
+  against that form or assume-role fails with "Not authorized to perform
+  sts:AssumeRoleWithWebIdentity". Confirmed via CloudTrail 2026-07-29. Because
+  the ID is per-repo, moving the ripper here from `erose/kexp-downloader`
+  (`@1315634626`) meant re-pointing the trust policy — a rename or a second
+  move would too.
+- **ffmpeg is not preinstalled on `ubuntu-latest`** and is installed by a step.
+  Nothing else is: the ripper is stdlib-only, so the job never installs
+  `requirements.txt` — `textual` is the player's dependency, not the ripper's.
+
 ## Tests
 
 ```sh
@@ -166,6 +244,9 @@ in for the decoder: it speaks the same line protocol, but on a compressed clock
 connections are reproducible instead of waiting for the network to misbehave.
 `tests/test_advance.py` drives the real UI through Textual's `run_test`, with
 the bucket stubbed out, and asserts on which track the player thinks it's on.
+`tests/test_archive.py` covers the ripper's archive path — offset arithmetic,
+stream resolution, the ffmpeg argv — with the network and ffmpeg both mocked,
+so it's fast and safe to run anywhere.
 
 ## Setup (already done)
 
