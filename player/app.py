@@ -58,13 +58,17 @@ class NowPlaying(Static):
     """Bottom bar: transport state, title, scrub bar."""
 
     BAR_WIDTH = 28
+    # Every state the backend can report. It rejects anything outside that set
+    # at the point it parses @P, so a missing key here is our own bug rather
+    # than something mpg123 said, and should be loud.
+    GLYPHS = {STOPPED: "■", PAUSED: "⏸", PLAYING: "▶", FINISHED: "■"}
 
     def show(self, track: Track | None, state: int, position: float, duration: float) -> None:
         if track is None:
             self.update(f"[{MUTED}]Press space to play — ↑↓ to move[/]")
             return
 
-        glyph = {PLAYING: "▶", PAUSED: "⏸", FINISHED: "■", STOPPED: "■"}.get(state, "■")
+        glyph = self.GLYPHS[state]
         # Rust while it's actually making sound, muted once it isn't, so the
         # bar tells you the state at a glance without reading the glyph.
         glyph_colour = RUST if state == PLAYING else MUTED

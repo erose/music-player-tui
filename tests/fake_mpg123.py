@@ -17,6 +17,9 @@ Failure injection, via FAKE_SCENARIO:
   drop_always   every stream dies at FAKE_DROP_AT, so recovery never succeeds
   stillborn     streams die before decoding a single frame, so end-of-track
                 arrives with no position or duration ever reported
+  bogus_state   an @P value outside the documented 0-3 arrives before
+                playback starts, standing in for a protocol we don't
+                understand
 
 The `drop` shapes are modelled on a real capture: hanging up mid-body made
 mpg123 emit `@P 3` then `@P 0` -- indistinguishable from a finished song
@@ -81,6 +84,8 @@ class Player:
                     pass
             emit("@I {")
             emit("@I }")
+            if SCENARIO == "bogus_state":
+                emit("@P 9")
             if paused:
                 self.state = PAUSED
                 emit("@P 1")

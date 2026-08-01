@@ -31,6 +31,7 @@ import time
 from collections.abc import Callable
 
 STOPPED, PAUSED, PLAYING, FINISHED = 0, 1, 2, 3
+STATES = (STOPPED, PAUSED, PLAYING, FINISHED)
 
 # mpg123 announces a dropped connection exactly as it announces a finished
 # song: @P 3 then @P 0, with no @E to tell them apart. (Captured from 1.32.9 by
@@ -211,6 +212,15 @@ class _Stream:
                 try:
                     state = int(rest.split()[0])
                 except (ValueError, IndexError):
+                    continue
+                if state not in STATES:
+                    # mpg123 documents 0-3. Anything else means we are reading
+                    # a protocol we don't understand, so keep it out of the
+                    # rest of the app rather than passing a value nothing knows
+                    # how to render. This is the only door such a value can
+                    # come in by, which is what lets everything downstream
+                    # treat the four states as exhaustive.
+                    audit(f"{self.name} !! unknown @P state {state}")
                     continue
                 # A LOADPAUSED reports @P 1 once the connection is open. That's
                 # the standby going ready, not a user-visible pause.

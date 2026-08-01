@@ -13,7 +13,8 @@ import unittest
 
 from support import DROPS_ONCE, Events, FakeBackendPath, PositionSampler, wait_until
 
-from player.backend import FINISHED, PLAYING, Mpg123
+from player.app import NowPlaying
+from player.backend import FINISHED, PLAYING, STATES, Mpg123
 
 LONG_TRACK = "http://stub/track-one#dur=600"
 NEXT_TRACK = "http://stub/track-two#dur=600"
@@ -141,6 +142,30 @@ class DroppedConnection(BackendTestCase):
             10,
             "gave up only after an unreasonable number of reconnects",
         )
+
+
+class UnexpectedState(BackendTestCase):
+    """@P is parsed from a subprocess, so its value is not to be trusted."""
+
+    def test_an_undocumented_state_never_reaches_the_app(self):
+        """The four states are exhaustive downstream only because they are
+        enforced here, at the one place an @P value gets in."""
+        backend = self.make_backend(FAKE_SPEED="100", FAKE_SCENARIO="bogus_state")
+        backend.play(LONG_TRACK)
+
+        self.assertTrue(
+            wait_until(lambda: backend.position > 20, timeout=10),
+            "an unknown @P value stopped playback instead of being ignored",
+        )
+        self.assertEqual(
+            [s for s in self.events.snapshot() if s not in STATES],
+            [],
+            "a state outside the documented 0-3 was passed on to the UI, "
+            "which has no glyph for it",
+        )
+
+    def test_the_ui_has_a_glyph_for_every_state_the_backend_can_report(self):
+        self.assertEqual(set(NowPlaying.GLYPHS), set(STATES))
 
 
 class WarmStandby(BackendTestCase):
