@@ -23,12 +23,36 @@ track the user is most likely to pick next. Starting a preloaded stream takes
 from __future__ import annotations
 
 import atexit
+import os
 import shutil
 import subprocess
 import threading
+import time
 from collections.abc import Callable
 
 STOPPED, PAUSED, PLAYING, FINISHED = 0, 1, 2, 3
+STATES = (STOPPED, PAUSED, PLAYING, FINISHED)
+
+# mpg123 announces a dropped connection exactly as it announces a finished
+# song: @P 3 then @P 0, with no @E to tell them apart. (Captured from 1.32.9 by
+# serving a real mp3 and hanging up mid-body: it reported end-of-track 25.51s
+# into a 581s track.) Taken at face value that reads as "song over" and the
+# player skips to the next track mid-song. The one remaining signal — how far
+# through the track we actually got — is what we go on instead. The tolerance
+# covers the gap between the last @F and the true end, which measures ~0.03s.
+END_TOLERANCE = 5.0
+
+# How much playback counts as having got somewhere since the last drop. A
+# separate question from END_TOLERANCE above, which is about how accurate
+# mpg123's duration estimate is; this one is about how much progress earns a
+# fresh reconnect budget. They start out the same size, but tuning one should
+# not move the other.
+PROGRESS_TOLERANCE = 5.0
+
+# Reconnects allowed without making progress before giving up on the track. A
+# stream that keeps dying in the same place is not going to play, so stop
+# rather than loop forever.
+MAX_RECONNECTS = 3
 
 # mpg123's decode loop blocks writing to the audio device, so it only services
 # stdin once per device buffer — with the default buffer that's a ~390ms lag
@@ -43,14 +67,39 @@ class BackendMissing(RuntimeError):
     pass
 
 
+# Playback failures are timing-dependent and happen minutes apart, which makes
+# them hard to catch in the act. Set PLAYER_LOG to a path to record every
+# command and reply, per process, with timestamps; PLAYER_LOG_FRAMES=1 also
+# keeps @F, which arrives ~40x a second. Off by default, near-free when off.
+_LOG_PATH = os.environ.get("PLAYER_LOG")
+_LOG_FRAMES = os.environ.get("PLAYER_LOG_FRAMES") == "1"
+_log_lock = threading.Lock()
+_log_file = None
+
+
+def audit(message: str) -> None:
+    if _LOG_PATH is None:
+        return
+    global _log_file
+    with _log_lock:
+        try:
+            if _log_file is None:
+                _log_file = open(_LOG_PATH, "a", buffering=1)
+            _log_file.write(f"{time.strftime('%H:%M:%S')} {message}\n")
+        except OSError:
+            pass  # a broken log must never take the player down with it
+
+
 class _Stream:
     """One mpg123 process. Callbacks fire on its reader thread."""
 
     def __init__(
         self,
+        name: str,
         on_state: Callable[["_Stream", int], None],
         on_error: Callable[["_Stream", str], None],
     ):
+        self.name = name
         self._on_state = on_state
         self._on_error = on_error
 
@@ -76,6 +125,7 @@ class _Stream:
         with self._lock:
             if self._proc.poll() is not None or self._proc.stdin is None:
                 return
+            audit(f"{self.name} >> {command}")
             try:
                 self._proc.stdin.write(command + "\n")
                 self._proc.stdin.flush()
@@ -146,6 +196,9 @@ class _Stream:
         for line in stdout:
             tag, _, rest = line.rstrip("\n")[1:].partition(" ") if line.startswith("@") else ("", "", "")
 
+            if tag != "F" or _LOG_FRAMES:
+                audit(f"{self.name} << {line.rstrip()}")
+
             if tag == "F":
                 parts = rest.split()
                 if len(parts) >= 4:
@@ -159,6 +212,15 @@ class _Stream:
                 try:
                     state = int(rest.split()[0])
                 except (ValueError, IndexError):
+                    continue
+                if state not in STATES:
+                    # mpg123 documents 0-3. Anything else means we are reading
+                    # a protocol we don't understand, so keep it out of the
+                    # rest of the app rather than passing a value nothing knows
+                    # how to render. This is the only door such a value can
+                    # come in by, which is what lets everything downstream
+                    # treat the four states as exhaustive.
+                    audit(f"{self.name} !! unknown @P state {state}")
                     continue
                 # A LOADPAUSED reports @P 1 once the connection is open. That's
                 # the standby going ready, not a user-visible pause.
@@ -194,13 +256,18 @@ class Mpg123:
         self.on_error = on_error
 
         self._streams = [
-            _Stream(self._state_event, self._error_event),
-            _Stream(self._state_event, self._error_event),
+            _Stream("A", self._state_event, self._error_event),
+            _Stream("B", self._state_event, self._error_event),
         ]
         self._active_ix = 0
         # Whether a start used the warm standby or had to open a connection.
         self.warm_starts = 0
         self.cold_starts = 0
+        # Reconnects made after a dropped stream; see _resume. Counts attempts,
+        # including ones that went on to fail, so it is not a success tally.
+        self.reconnects = 0
+        self._attempts = 0  # reconnect budget for the current track
+        self._resume_position = 0.0
         # The UI calls quit() on unmount, but if the app dies some other way an
         # orphaned mpg123 keeps playing with no window to stop it. atexit
         # covers a crash or an unhandled exception; nothing can cover SIGKILL.
@@ -235,8 +302,44 @@ class Mpg123:
     def _state_event(self, stream: _Stream, state: int) -> None:
         # The outgoing stream reports @P 0 as it is stopped; ignore anything
         # that isn't the stream currently on the speakers.
-        if stream is self._active:
-            self.on_state(state)
+        if stream is not self._active:
+            return
+        if state == FINISHED and self._died_early(stream):
+            self._resume(stream)
+            return
+        self.on_state(state)
+
+    def _died_early(self, stream: _Stream) -> bool:
+        """Did this end-of-track arrive before the end of the track?
+
+        A duration of 0 means no @F ever arrived, so the stream produced no
+        audio at all — a failure however it is counted.
+        """
+        if stream.duration <= 0:
+            return True
+        return stream.position < stream.duration - END_TOLERANCE
+
+    def _resume(self, stream: _Stream) -> None:
+        """Carry on from where a dropped stream left off, instead of letting
+        the app mistake it for the end of the song."""
+        position = stream.position
+        if position > self._resume_position + PROGRESS_TOLERANCE:
+            self._attempts = 0  # it got somewhere since the last drop
+        self._resume_position = position
+
+        if self._attempts >= MAX_RECONNECTS:
+            audit(f"giving up at {position:.1f}s after {self._attempts} reconnects")
+            self.on_error(f"Stream keeps dropping at {int(position)}s — skipping track.")
+            self.on_state(FINISHED)
+            return
+
+        self._attempts += 1
+        self.reconnects += 1
+        audit(
+            f"{stream.name} dropped at {position:.1f}s of {stream.duration:.1f}s "
+            f"— reconnecting (attempt {self._attempts})"
+        )
+        stream.restart_at(int(position), stay_paused=False)
 
     def _error_event(self, stream: _Stream, message: str) -> None:
         if stream is self._active:
@@ -251,6 +354,10 @@ class Mpg123:
         self._standby.load_paused(url)
 
     def play(self, url: str) -> None:
+        # A new track starts its own reconnect budget.
+        self._attempts = 0
+        self._resume_position = 0.0
+
         standby = self._standby
         if standby.ready and standby.url == url:
             outgoing = self._active

@@ -12,7 +12,7 @@ from textual.widgets import DataTable, Footer, Header, Label, ListItem, ListView
 
 from .backend import FINISHED, PAUSED, PLAYING, STOPPED, BackendMissing, Mpg123
 from .library import Day, Library, Track
-from .theme import AMBER, KEXP_THEME, MUTED, RUST
+from .theme import AMBER, PLAYER_THEME, MUTED, RUST
 
 def format_time(seconds: float) -> str:
     seconds = max(0, int(seconds))
@@ -58,13 +58,17 @@ class NowPlaying(Static):
     """Bottom bar: transport state, title, scrub bar."""
 
     BAR_WIDTH = 28
+    # Every state the backend can report. It rejects anything outside that set
+    # at the point it parses @P, so a missing key here is our own bug rather
+    # than something mpg123 said, and should be loud.
+    GLYPHS = {STOPPED: "■", PAUSED: "⏸", PLAYING: "▶", FINISHED: "■"}
 
     def show(self, track: Track | None, state: int, position: float, duration: float) -> None:
         if track is None:
             self.update(f"[{MUTED}]Press space to play — ↑↓ to move[/]")
             return
 
-        glyph = {PLAYING: "▶", PAUSED: "⏸", FINISHED: "■", STOPPED: "■"}.get(state, "■")
+        glyph = self.GLYPHS[state]
         # Rust while it's actually making sound, muted once it isn't, so the
         # bar tells you the state at a glance without reading the glyph.
         glyph_colour = RUST if state == PLAYING else MUTED
@@ -158,9 +162,10 @@ class MusicPlayer(App):
     # an arrow key doesn't fire a preload per row.
     PRELOAD_DEBOUNCE = 0.25
 
-    def __init__(self) -> None:
+    def __init__(self, library: Library | None = None) -> None:
         super().__init__()
-        self.library = Library()
+        # Injectable so tests can drive the UI without reaching the bucket.
+        self.library = library if library is not None else Library()
         self.backend: Mpg123 | None = None
         self.days: list[Day] = []
         self.shown_day: Day | None = None
@@ -185,8 +190,8 @@ class MusicPlayer(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.register_theme(KEXP_THEME)
-        self.theme = KEXP_THEME.name
+        self.register_theme(PLAYER_THEME)
+        self.theme = PLAYER_THEME.name
 
         table = self.query_one("#tracks", TrackTable)
         table.cursor_type = "row"
@@ -387,10 +392,16 @@ class MusicPlayer(App):
     def _refresh_now_playing(self) -> None:
         if self.backend is None:
             return
+        # This runs on a timer, which can still fire a tick after the widget
+        # tree has been torn down on quit — query_one would raise from inside
+        # the timer callback and surface as a crash on exit.
+        bar = self.query(NowPlaying)
+        if not bar:
+            return
         track = None
         if self.playing_day is not None and self.playing_index is not None:
             track = self.playing_day.tracks[self.playing_index]
-        self.query_one(NowPlaying).show(
+        bar.first().show(
             track, self.backend.state, self.backend.position, self.backend.duration
         )
 

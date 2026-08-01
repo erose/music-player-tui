@@ -1,4 +1,4 @@
-# kexp-player
+# player
 
 A terminal player for the KEXP Morning Show rolling downloads in
 `s3://elis-music/kexp-morning-show-rolling-downloads`.
@@ -12,7 +12,7 @@ to the audio device. The only objects ever fetched are the few-KB
 ## Run
 
 ```sh
-./kexp
+./play
 ```
 
 ## Keys
@@ -36,7 +36,9 @@ may not be the row you're on. Volume is the system volume.
 
 When a song ends the next one starts automatically. The cursor follows along if
 it was sitting on the song that just finished, and stays where you put it if
-you'd arrowed off to browse.
+you'd arrowed off to browse. If the stream drops part-way through a song the
+player reconnects and picks up where it left off, rather than treating it as
+the end of the track — see the note below.
 
 ## How it works
 
@@ -69,6 +71,26 @@ public bucket ──HTTPS──► mpg123 -R ──PCM──► CoreAudio
 
 ## Notes
 
+- **A dropped connection is indistinguishable from a finished song**, which is
+  what used to make the player skip to the next track mid-song. mpg123 reports
+  both as `@P 3` followed by `@P 0`, with no `@E` in between — captured by
+  serving a real mp3 and hanging up mid-body, which produced end-of-track
+  25.51s into a 581s track. The only signal separating them is how far through
+  the track the last `@F` got, so `Mpg123._died_early` compares position
+  against duration and, when a stream died early, reconnects and seeks back to
+  where it stopped instead of reporting the end. A track that keeps dying in
+  the same spot is given up on after `MAX_RECONNECTS` attempts with an error,
+  so recovery can't become an infinite reconnect loop. `backend.reconnects`
+  counts reconnect attempts, including ones that went on to fail, so it is a
+  fault gauge rather than a success tally. Note the check needs the duration
+  estimate to be trustworthy: measured at the real end of a track, `@F`
+  reported 0.03s remaining, against an `END_TOLERANCE` of 5s.
+- **`PLAYER_LOG=/tmp/player.log` records every command and reply**, per
+  process, with timestamps — `A >> LOAD ...`, `A << @P 3`, plus the decisions
+  the backend makes. Add `PLAYER_LOG_FRAMES=1` to keep `@F` too, which arrives
+  ~40x a second. Off by default. Playback faults happen minutes apart and
+  depend on the network, so reconstructing one after the fact beats trying to
+  catch it live.
 - **`backend.seek()` exists but is not bound to a key.** Kept because it's
   working and tested, in case scrubbing is wanted later. Note that `mpg123`
   consumes the HTTP response sequentially and can only seek *forward* within a
@@ -115,6 +137,19 @@ public bucket ──HTTPS──► mpg123 -R ──PCM──► CoreAudio
   player stops working and would need signing put back.
 - Duplicate playlist entries are preserved — on 2026-07-28 the Pixies genuinely
   aired twice, at 8:11 and 8:14.
+
+## Tests
+
+```sh
+.venv/bin/python -m unittest discover -s tests -t tests
+```
+
+Stdlib `unittest`, no test dependency to install. `tests/fake_mpg123.py` stands
+in for the decoder: it speaks the same line protocol, but on a compressed clock
+(a 10-minute track finishes in seconds) and with failure injection, so dropped
+connections are reproducible instead of waiting for the network to misbehave.
+`tests/test_advance.py` drives the real UI through Textual's `run_test`, with
+the bucket stubbed out, and asserts on which track the player thinks it's on.
 
 ## Setup (already done)
 
