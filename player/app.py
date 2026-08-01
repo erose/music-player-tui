@@ -158,9 +158,10 @@ class MusicPlayer(App):
     # an arrow key doesn't fire a preload per row.
     PRELOAD_DEBOUNCE = 0.25
 
-    def __init__(self) -> None:
+    def __init__(self, library: Library | None = None) -> None:
         super().__init__()
-        self.library = Library()
+        # Injectable so tests can drive the UI without reaching the bucket.
+        self.library = library if library is not None else Library()
         self.backend: Mpg123 | None = None
         self.days: list[Day] = []
         self.shown_day: Day | None = None
@@ -387,10 +388,16 @@ class MusicPlayer(App):
     def _refresh_now_playing(self) -> None:
         if self.backend is None:
             return
+        # This runs on a timer, which can still fire a tick after the widget
+        # tree has been torn down on quit — query_one would raise from inside
+        # the timer callback and surface as a crash on exit.
+        bar = self.query(NowPlaying)
+        if not bar:
+            return
         track = None
         if self.playing_day is not None and self.playing_index is not None:
             track = self.playing_day.tracks[self.playing_index]
-        self.query_one(NowPlaying).show(
+        bar.first().show(
             track, self.backend.state, self.backend.position, self.backend.duration
         )
 
