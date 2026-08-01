@@ -52,10 +52,10 @@ public bucket ──HTTPS──► mpg123 -R ──PCM──► CoreAudio
 - `player/library.py` — plain HTTPS against the public bucket using only the
   standard library: `urllib` plus `ElementTree` to parse the `ListObjectsV2`
   XML, including continuation-token pagination. One listing of the prefix gives
-  every date folder and its track count in a single pass; `playlist.json` supplies artist,
-  song, album and airdate, with a filename-parsing fallback if it's absent.
-  Entries listed in the playlist but missing from the bucket are shown struck
-  through rather than failing at play time.
+  every date folder and its track count in a single pass; `playlist.json`
+  supplies artist, song, album and airdate, and is required rather than
+  best-effort — see the note below. Entries listed in the playlist but missing
+  from the bucket are shown struck through rather than failing at play time.
 - `player/backend.py` — drives `mpg123 -R`, a line protocol on stdin/stdout.
   `@F` reports real elapsed and remaining seconds, so the progress bar and
   duration are exact rather than estimated from wall clock. Runs *two* mpg123
@@ -71,6 +71,22 @@ public bucket ──HTTPS──► mpg123 -R ──PCM──► CoreAudio
 
 ## Notes
 
+- **`playlist.json` is required, and its absence is an error rather than a
+  fallback.** The ripper writes it alongside the mp3s and the upload step reads
+  it to derive the date *before* syncing, so a day folder can only exist in the
+  bucket because its playlist existed first. `load_day` used to parse
+  `Artist - Song.mp3` when the fetch failed, which guarded a state that cannot
+  persist and produced album-less, airdate-less tracks indistinguishable from
+  real ones. It also treated *every* failure as "no playlist" — `HTTPError`
+  subclasses `URLError`, so a 404, a 500 and a connection reset were the same
+  thing — and then set `loaded`, caching the degraded result for the session.
+  Now a missing or unreadable playlist raises `PlaylistMissing` and anything
+  else propagates, both leaving `loaded` false so re-selecting the day retries.
+  The one moment a day can genuinely lack a playlist is the few seconds
+  `aws s3 sync` takes: it uploads the directory in parallel, unordered, so on
+  2026-07-31 the playlist landed a second *before* the final mp3. Hence the
+  wording of the error, and hence keeping `available=False` for the mirror
+  case of an entry whose audio has not landed yet.
 - **A dropped connection is indistinguishable from a finished song**, which is
   what used to make the player skip to the next track mid-song. mpg123 reports
   both as `@P 3` followed by `@P 0`, with no `@E` in between — captured by

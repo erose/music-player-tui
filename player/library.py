@@ -26,6 +26,12 @@ S3_NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
 TIMEOUT = 20
 
 
+class PlaylistMissing(RuntimeError):
+    """A day's playlist.json is absent or unreadable, so its tracks are
+    unknown. Distinct from a transient fetch failure, which propagates as
+    whatever urllib raised."""
+
+
 @dataclass
 class Track:
     artist: str
@@ -108,59 +114,61 @@ class Library:
         return sorted(days.values(), key=lambda d: d.date, reverse=True)
 
     def load_day(self, day: Day) -> Day:
-        """Populate a Day's tracks from playlist.json, falling back to the mp3 listing."""
+        """Populate a Day's tracks from its playlist.json.
+
+        The playlist is required, not best-effort. Every day is uploaded with
+        one, so its absence means the upload is still in flight or something
+        upstream is broken — both worth surfacing rather than papering over
+        with metadata guessed from filenames.
+
+        Raises rather than half-loading, and leaves `loaded` false, so
+        re-selecting the day tries again.
+        """
         if day.loaded:
             return day
 
-        present = {k.rsplit("/", 1)[-1]: k for k in day.mp3_keys}
         playlist = self._fetch_playlist(day)
+        present = {k.rsplit("/", 1)[-1]: k for k in day.mp3_keys}
 
-        if playlist is None:
-            # No playlist.json — fall back to filenames, which follow
-            # "Artist - Song.mp3" throughout this bucket.
-            for key in sorted(day.mp3_keys):
-                name = key.rsplit("/", 1)[-1]
-                stem = name[:-4]
-                artist, sep, song = stem.partition(" - ")
-                day.tracks.append(
-                    Track(
-                        artist=artist if sep else "",
-                        song=song if sep else stem,
-                        album="",
-                        airdate="",
-                        filename=name,
-                        key=key,
-                    )
+        day.program = playlist.get("program", "")
+        day.host = playlist.get("host", "")
+        for entry in playlist.get("tracks", []):
+            name = entry.get("file", "")
+            key = present.get(name, f"{day.prefix}/{name}")
+            day.tracks.append(
+                Track(
+                    artist=entry.get("artist", ""),
+                    song=entry.get("song", ""),
+                    album=entry.get("album", ""),
+                    airdate=entry.get("airdate", ""),
+                    filename=name,
+                    key=key,
+                    # A playlist entry with no matching object would 404 at
+                    # play time; flag it so the UI can grey it out instead.
+                    # The mp3s and the playlist go up in one batch but not
+                    # atomically, so a day caught mid-upload can genuinely
+                    # list a track whose audio has not landed yet.
+                    available=name in present,
                 )
-        else:
-            day.program = playlist.get("program", "")
-            day.host = playlist.get("host", "")
-            for entry in playlist.get("tracks", []):
-                name = entry.get("file", "")
-                key = present.get(name, f"{day.prefix}/{name}")
-                day.tracks.append(
-                    Track(
-                        artist=entry.get("artist", ""),
-                        song=entry.get("song", ""),
-                        album=entry.get("album", ""),
-                        airdate=entry.get("airdate", ""),
-                        filename=name,
-                        key=key,
-                        # A playlist entry with no matching object would 404 at
-                        # play time; flag it so the UI can grey it out instead.
-                        available=name in present,
-                    )
-                )
+            )
 
         day.loaded = True
         return day
 
-    def _fetch_playlist(self, day: Day) -> dict | None:
+    def _fetch_playlist(self, day: Day) -> dict:
+        url = self.url(f"{day.prefix}/playlist.json")
         try:
-            body = self._get(self.url(f"{day.prefix}/playlist.json"))
-        except (urllib.error.URLError, OSError):
-            return None
+            body = self._get(url)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                # Distinguishable because the bucket allows anonymous listing;
+                # without that S3 would answer 403 for a missing key too.
+                raise PlaylistMissing(
+                    f"{day.date} has no playlist.json yet — if the upload is "
+                    "still running, try again in a moment."
+                ) from exc
+            raise
         try:
             return json.loads(body)
-        except ValueError:
-            return None
+        except ValueError as exc:
+            raise PlaylistMissing(f"{day.date} has an unreadable playlist.json") from exc
