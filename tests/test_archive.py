@@ -105,15 +105,82 @@ class TestResolveStream(unittest.TestCase):
         self.assertIn("location=3", req.full_url)
 
 
+class TestComputeCuts(unittest.TestCase):
+    """The partition invariants — these are the whole point of the design.
+
+    Assertions are stated as properties (contiguity, coverage) rather than magic
+    numbers, so they keep holding if the boundary *placement* is ever retuned.
+    """
+
+    def test_windows_are_contiguous(self):
+        cuts = m.compute_cuts([100, 300, 500], 0.0, 700.0, shift=10)
+        for a, b in zip(cuts, cuts[1:]):
+            self.assertEqual(a["end"], b["start"])   # one number, used twice
+
+    def test_no_overlap_and_no_gap(self):
+        # The regression this whole change exists for: the old code emitted a
+        # constant lead+tail (23s) of duplicated audio at every boundary.
+        cuts = m.compute_cuts([100, 300, 500], 0.0, 700.0, shift=42)
+        for a, b in zip(cuts, cuts[1:]):
+            self.assertEqual(b["start"] - a["end"], 0.0)
+
+    def test_covers_the_whole_show(self):
+        cuts = m.compute_cuts([100, 300, 500], 0.0, 700.0, shift=42)
+        self.assertEqual(cuts[0]["start"], 0.0)      # show open folded into T1
+        self.assertEqual(cuts[-1]["end"], 700.0)     # close folded into the last
+        total = sum(c["end"] - c["start"] for c in cuts)
+        self.assertAlmostEqual(total, 700.0)         # every second accounted for
+
+    def test_boundaries_use_shift(self):
+        cuts = m.compute_cuts([100, 300], 0.0, 700.0, shift=42)
+        self.assertEqual(cuts[1]["start"], 300 - 42)
+
+    def test_out_of_order_airdate_merges_instead_of_dropping(self):
+        # Second offset lands before the first boundary. The old code hit
+        # `dur <= 0` and skipped the track, losing that audio entirely.
+        cuts = m.compute_cuts([100, 300, 200], 0.0, 700.0, shift=42)
+        self.assertEqual(cuts[1]["end"], cuts[1]["start"])       # collapsed
+        for a, b in zip(cuts, cuts[1:]):
+            self.assertEqual(a["end"], b["start"])               # still contiguous
+        self.assertAlmostEqual(sum(c["end"] - c["start"] for c in cuts), 700.0)
+
+    def test_boundaries_clamped_inside_the_show(self):
+        # A wild offset can't push a window outside the show's span.
+        cuts = m.compute_cuts([100, 99999], 0.0, 700.0, shift=42)
+        for c in cuts:
+            self.assertGreaterEqual(c["start"], 0.0)
+            self.assertLessEqual(c["end"], 700.0)
+
+    def test_empty(self):
+        self.assertEqual(m.compute_cuts([], 0.0, 700.0, shift=42), [])
+
+
 class TestDownloadArchive(unittest.TestCase):
+    # Chosen so the show sits comfortably inside the chunk: the chunk begins at
+    # A1-922 = 06:50:06, so the 06:50:30 show start is 24s into it.
+    START = "2026-07-28T06:50:30-07:00"
+    END = "2026-07-28T07:30:00-07:00"
+    A1 = "2026-07-28T07:05:28-07:00"
+    A2 = "2026-07-28T07:08:01-07:00"
+    A3 = "2026-07-28T07:11:38-07:00"
+    FILE_DUR = 2500.0
+    # Expected boundaries as offsets in the chunk: show start, A2-shift,
+    # A3-shift, show end.
+    B0, B1, B2, B3 = 24.0, 1033.0, 1250.0, 2394.0
+
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
-        # Redirect output into a temp dir so we never touch real downloads/.
-        self._dir_patch = mock.patch.object(m, "DOWNLOAD_DIR", self.tmp)
-        self._dir_patch.start()
-        # ffmpeg "present" without needing it installed.
-        self._which_patch = mock.patch.object(m.shutil, "which", return_value="/bin/ffmpeg")
-        self._which_patch.start()
+        # Redirect output into a temp dir so we never touch real downloads/;
+        # ffmpeg/ffprobe "present" without needing them installed; chunk
+        # durations answered without touching the network.
+        self._patches = [
+            mock.patch.object(m, "DOWNLOAD_DIR", self.tmp),
+            mock.patch.object(m.shutil, "which", return_value="/bin/ffmpeg"),
+            mock.patch.object(m, "probe_duration", side_effect=lambda t: self.FILE_DUR),
+        ]
+        for p in self._patches:
+            p.start()
+
         # Record every ffmpeg invocation and fake a successful rip by touching
         # the output file (download_archive checks the file exists afterwards).
         self.calls = []
@@ -124,131 +191,157 @@ class TestDownloadArchive(unittest.TestCase):
             return types.SimpleNamespace(returncode=0)
 
         self._run_patch = mock.patch.object(m.subprocess, "run", side_effect=fake_run)
-        self.run_mock = self._run_patch.start()
+        self._run_patch.start()
 
     def tearDown(self):
-        self._dir_patch.stop()
-        self._which_patch.stop()
         self._run_patch.stop()
+        for p in self._patches:
+            p.stop()
 
     def _patch_resolver(self, mapping):
-        """Patch resolve_stream to look up (url, offset) by airdate string."""
+        """Patch resolve_stream to look up (url, offset) by timestamp string."""
         def fake(ts, bitrate=256, location=3):
             return mapping[ts]
         return mock.patch.object(m, "resolve_stream", side_effect=fake)
 
-    def test_durations_from_offset_deltas(self):
-        a1, a2, a3 = ("2026-07-28T07:05:28-07:00",
-                      "2026-07-28T07:08:01-07:00",
-                      "2026-07-28T07:11:38-07:00")
-        end = "2026-07-28T09:50:00-07:00"
+    def _standard(self):
+        """Three tracks in one show file; the show's end is in the next file."""
         mapping = {
-            a1: ("show.mp3", 922),
-            a2: ("show.mp3", 1075),
-            a3: ("show.mp3", 1292),
-            end: ("nextshow.mp3", 5),   # boundary → different file
+            self.START: ("show.mp3", 0),
+            self.A1: ("show.mp3", 922),
+            self.A2: ("show.mp3", 1075),
+            self.A3: ("show.mp3", 1292),
+            self.END: ("nextshow.mp3", 5),
         }
-        tracks = [play("R.E.M.", "Fall on Me", a1),
-                  play("Quivers", "You're Not Always On My Mind", a2),
-                  play("10,000 Maniacs", "These Are Days", a3)]
-        with self._patch_resolver(mapping), mock.patch("builtins.print"):
-            m.download_archive(tracks, end, shift=0, lead=0, tail=0)   # isolate duration logic
+        tracks = [play("R.E.M.", "Fall on Me", self.A1),
+                  play("Quivers", "You're Not Always On My Mind", self.A2),
+                  play("10,000 Maniacs", "These Are Days", self.A3)]
+        return mapping, tracks
 
-        self.assertEqual(len(self.calls), 3)
-        # T1: 1075-922 = 153; T2: 1292-1075 = 217
-        self.assertEqual(ffmpeg_arg(self.calls[0], "-ss"), "922.000")
-        self.assertEqual(ffmpeg_arg(self.calls[0], "-t"), "153.000")
-        self.assertEqual(ffmpeg_arg(self.calls[1], "-ss"), "1075.000")
-        self.assertEqual(ffmpeg_arg(self.calls[1], "-t"), "217.000")
-        # -i is the show URL, output is Artist - Song.mp3
+    def _windows(self):
+        """(start, end) actually handed to ffmpeg, in call order."""
+        out = []
+        for c in self.calls:
+            start = float(ffmpeg_arg(c, "-ss"))
+            out.append((start, start + float(ffmpeg_arg(c, "-t"))))
+        return out
+
+    def test_emitted_windows_are_contiguous(self):
+        mapping, tracks = self._standard()
+        with self._patch_resolver(mapping), mock.patch("builtins.print"):
+            m.download_archive(tracks, self.START, self.END)
+        wins = self._windows()
+        self.assertEqual(len(wins), 3)
+        for (_, end), (start, _) in zip(wins, wins[1:]):
+            self.assertAlmostEqual(end, start, places=3)   # no repeat, no gap
+
+    def test_covers_the_whole_show(self):
+        mapping, tracks = self._standard()
+        with self._patch_resolver(mapping), mock.patch("builtins.print"):
+            m.download_archive(tracks, self.START, self.END)
+        wins = self._windows()
+        self.assertAlmostEqual(wins[0][0], self.B0, places=3)    # show open
+        self.assertAlmostEqual(wins[-1][1], self.B3, places=3)   # show close
+        total = sum(e - s for s, e in wins)
+        self.assertAlmostEqual(total, self.B3 - self.B0, places=3)
+
+    def test_cuts_stream_from_the_chunk_url(self):
+        mapping, tracks = self._standard()
+        with self._patch_resolver(mapping), mock.patch("builtins.print"):
+            m.download_archive(tracks, self.START, self.END)
         self.assertEqual(ffmpeg_arg(self.calls[0], "-i"), "show.mp3")
         self.assertTrue(self.calls[0][-1].endswith("R.E.M. - Fall on Me.mp3"))
 
-    def test_last_track_same_file_uses_end_offset(self):
-        a1 = "2026-07-28T09:47:00-07:00"
-        end = "2026-07-28T09:50:00-07:00"
-        mapping = {a1: ("show.mp3", 10000), end: ("show.mp3", 10180)}
-        with self._patch_resolver(mapping), mock.patch("builtins.print"):
-            m.download_archive([play("Belly", "Dusted", a1)], end, shift=0, lead=0, tail=0)
-        # end resolves to the SAME file → exact length 10180-10000 = 180
-        self.assertEqual(ffmpeg_arg(self.calls[0], "-t"), "180.000")
+    def test_overlapping_chunks_do_not_duplicate_at_the_seam(self):
+        """The real-world case: archive chunks overlap in broadcast time.
 
-    def test_last_track_diff_file_caps_duration(self):
-        a1 = "2026-07-28T09:47:00-07:00"
-        end = "2026-07-28T12:00:00-07:00"      # ~2h13m gap
-        mapping = {a1: ("show.mp3", 10000), end: ("nextshow.mp3", 3)}
+        The morning-show chunk keeps running past the point where the next
+        show's chunk begins, so the same minutes exist in both. Cutting each
+        chunk separately hands that stretch to two different tracks — the very
+        repetition this design exists to prevent.
+        """
+        mapping, tracks = self._standard()
+        # Third track resolves into a LATER chunk that starts after the boundary
+        # between tracks 2 and 3, so only the first chunk can supply that audio.
+        mapping[self.A3] = ("midday.mp3", 20)
         with self._patch_resolver(mapping), mock.patch("builtins.print"):
-            m.download_archive([play("Belly", "Dusted", a1)], end, shift=0, lead=0, tail=0)
-        # Different file → falls back to airdate gap, capped at MAX_SONG_SEC.
-        self.assertEqual(ffmpeg_arg(self.calls[0], "-t"), f"{float(m.MAX_SONG_SEC):.3f}")
+            cuts = m.download_archive(tracks, self.START, self.END)
+        wins = self._windows()
+        # Every window still comes from a chunk that holds it, and consecutive
+        # windows meet exactly — no repeated seconds across the chunk seam.
+        for (_, end), (start, _) in zip(wins, wins[1:]):
+            self.assertAlmostEqual(end, start, places=3)
+        self.assertEqual(cuts[self.A3]["source"], "show.mp3")
+        total = sum(e - s for s, e in wins)
+        self.assertAlmostEqual(total, self.B3 - self.B0, places=3)
+
+    def test_prefers_the_tracks_own_chunk_when_it_covers_the_window(self):
+        mapping, tracks = self._standard()
+        with self._patch_resolver(mapping), mock.patch("builtins.print"):
+            cuts = m.download_archive(tracks, self.START, self.END)
+        for airdate in (self.A1, self.A2, self.A3):
+            self.assertEqual(cuts[airdate]["source"], "show.mp3")
+
+    def test_returns_cut_info_for_the_manifest(self):
+        mapping, tracks = self._standard()
+        with self._patch_resolver(mapping), mock.patch("builtins.print"):
+            cuts = m.download_archive(tracks, self.START, self.END)
+        self.assertEqual(set(cuts), {self.A1, self.A2, self.A3})
+        first = cuts[self.A1]
+        self.assertEqual(first["start_offset"], self.B0)
+        self.assertEqual(first["source"], "show.mp3")
+        self.assertAlmostEqual(first["duration"],
+                               first["end_offset"] - first["start_offset"], places=3)
 
     def test_skips_existing_file(self):
-        a1, a2 = "2026-07-28T07:05:28-07:00", "2026-07-28T07:08:01-07:00"
-        end = "2026-07-28T09:50:00-07:00"
-        mapping = {a1: ("show.mp3", 922), a2: ("show.mp3", 1075),
-                   end: ("nextshow.mp3", 5)}
-        # Pre-create the second track's output so it should be skipped.
+        mapping, tracks = self._standard()
         existing = os.path.join(self.tmp, "Quivers - You're Not Always On My Mind.mp3")
         open(existing, "w").close()
-        tracks = [play("R.E.M.", "Fall on Me", a1),
-                  play("Quivers", "You're Not Always On My Mind", a2)]
         with self._patch_resolver(mapping), mock.patch("builtins.print"):
-            m.download_archive(tracks, end)
-        # Only the first track triggers an ffmpeg call.
-        self.assertEqual(len(self.calls), 1)
-        self.assertTrue(self.calls[0][-1].endswith("R.E.M. - Fall on Me.mp3"))
+            m.download_archive(tracks, self.START, self.END)
+        self.assertEqual(len(self.calls), 2)   # the pre-existing one is skipped
+        self.assertFalse(any(c[-1] == existing for c in self.calls))
 
-    def test_lead_tail_padding_widens_window(self):
-        a1, a2 = "2026-07-28T07:05:28-07:00", "2026-07-28T07:08:01-07:00"
-        end = "2026-07-28T09:50:00-07:00"
-        mapping = {a1: ("show.mp3", 922), a2: ("show.mp3", 1075),
-                   end: ("nextshow.mp3", 5)}
-        tracks = [play("R.E.M.", "Fall on Me", a1),
-                  play("Quivers", "X", a2)]
+    def test_recut_overwrites_existing(self):
+        mapping, tracks = self._standard()
+        existing = os.path.join(self.tmp, "Quivers - You're Not Always On My Mind.mp3")
+        open(existing, "w").close()
         with self._patch_resolver(mapping), mock.patch("builtins.print"):
-            m.download_archive(tracks, end, shift=0, lead=15, tail=10)
-        # start = 922-15 = 907; length = (922+153+10) - 907 = 178
-        self.assertEqual(ffmpeg_arg(self.calls[0], "-ss"), "907.000")
-        self.assertEqual(ffmpeg_arg(self.calls[0], "-t"), "178.000")
+            m.download_archive(tracks, self.START, self.END, recut=True)
+        self.assertEqual(len(self.calls), 3)   # stale cut is replaced
 
-    def test_lead_clamps_at_zero(self):
-        a1 = "2026-07-28T07:00:05-07:00"
-        end = "2026-07-28T07:03:00-07:00"
-        mapping = {a1: ("show.mp3", 8), end: ("show.mp3", 188)}   # offset 8 < lead
+    def test_collapsed_window_is_skipped_not_ripped(self):
+        # Boundaries come from AIRDATES, so it takes an out-of-order airdate --
+        # not merely an out-of-order offset -- to collapse a window.
+        mapping, _ = self._standard()
+        tracks = [play("R.E.M.", "Fall on Me", self.A1),
+                  play("10,000 Maniacs", "These Are Days", self.A3),
+                  play("Quivers", "Out Of Order", self.A2)]
         with self._patch_resolver(mapping), mock.patch("builtins.print"):
-            m.download_archive([play("First", "Song", a1)], end, shift=0, lead=15, tail=10)
-        # start clamps to 0; length = (8+180+10) - 0 = 198
-        self.assertEqual(ffmpeg_arg(self.calls[0], "-ss"), "0.000")
-        self.assertEqual(ffmpeg_arg(self.calls[0], "-t"), "198.000")
-
-    def test_shift_moves_window_earlier(self):
-        a1, a2 = "2026-07-28T07:05:28-07:00", "2026-07-28T07:08:01-07:00"
-        end = "2026-07-28T09:50:00-07:00"
-        mapping = {a1: ("show.mp3", 922), a2: ("show.mp3", 1075),
-                   end: ("nextshow.mp3", 5)}
-        tracks = [play("R.E.M.", "Fall on Me", a1), play("Quivers", "X", a2)]
-        with self._patch_resolver(mapping), mock.patch("builtins.print"):
-            m.download_archive(tracks, end, shift=42, lead=15, tail=8)
-        # start = 922 - 42 - 15 = 865; end = 922 + 153 - 42 + 8 = 1041; len = 176
-        self.assertEqual(ffmpeg_arg(self.calls[0], "-ss"), "865.000")
-        self.assertEqual(ffmpeg_arg(self.calls[0], "-t"), "176.000")
+            m.download_archive(tracks, self.START, self.END)
+        self.assertEqual(len(self.calls), 2)     # the collapsed one is not ripped
+        wins = self._windows()
+        for start, end in wins:
+            self.assertGreaterEqual(end - start, m.MIN_TRACK_SEC)
+        # The audio it would have held is absorbed by its neighbour, not lost.
+        self.assertAlmostEqual(sum(e - s for s, e in wins),
+                               self.B3 - self.B0, places=3)
 
     def test_filename_sanitizes_slash(self):
-        a1 = "2026-07-28T07:05:28-07:00"
-        end = "2026-07-28T09:50:00-07:00"
-        mapping = {a1: ("show.mp3", 100), end: ("nextshow.mp3", 5)}
+        mapping = {self.START: ("show.mp3", 0), self.A1: ("show.mp3", 100),
+                   self.END: ("nextshow.mp3", 5)}
         with self._patch_resolver(mapping), mock.patch("builtins.print"):
-            m.download_archive([play("Man/Woman/Chainsaw", "Nosedive", a1)], end)
+            m.download_archive([play("Man/Woman/Chainsaw", "Nosedive", self.A1)],
+                               self.START, self.END)
         self.assertTrue(self.calls[0][-1].endswith(
             "Man⧸Woman⧸Chainsaw - Nosedive.mp3"))
 
     def test_skips_tracks_missing_metadata(self):
-        a1 = "2026-07-28T07:05:28-07:00"
-        end = "2026-07-28T09:50:00-07:00"
-        mapping = {a1: ("show.mp3", 100), end: ("nextshow.mp3", 5)}
-        tracks = [play("", "", a1), play(None, "Song", a1)]
+        mapping = {self.START: ("show.mp3", 0), self.A1: ("show.mp3", 100),
+                   self.END: ("nextshow.mp3", 5)}
+        tracks = [play("", "", self.A1), play(None, "Song", self.A1)]
         with self._patch_resolver(mapping), mock.patch("builtins.print"):
-            m.download_archive(tracks, end)
+            m.download_archive(tracks, self.START, self.END)
         self.assertEqual(len(self.calls), 0)
 
 
@@ -367,6 +460,21 @@ class TestWriteManifest(unittest.TestCase):
         t = data["tracks"][0]
         self.assertEqual(t["file"], "Man⧸Woman⧸Chainsaw - Nosedive.mp3")
         self.assertEqual(t["album"], "Modern Job")
+        self.assertNotIn("cut", t)   # no cut info supplied → key omitted
+
+    def test_records_cut_spans_when_supplied(self):
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "playlist.json")
+        airdate = "2026-07-28T07:15:00-07:00"
+        tracks = [play("Belly", "Dusted", airdate)]
+        cuts = {airdate: {"start_offset": 100.0, "end_offset": 280.5,
+                          "duration": 180.5, "source": "show.mp3"}}
+        m.write_manifest(path, "The Morning Show", "John Richards",
+                         "2026-07-28", tracks, cuts)
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["tracks"][0]["cut"]["start_offset"], 100.0)
+        self.assertEqual(data["tracks"][0]["cut"]["source"], "show.mp3")
 
 
 if __name__ == "__main__":
