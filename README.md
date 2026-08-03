@@ -183,6 +183,7 @@ python3 morning_show_playlist.py                     # today's playlist, printed
 python3 morning_show_playlist.py 2026-06-22          # a specific date
 python3 morning_show_playlist.py --csv               # CSV instead of a list
 python3 morning_show_playlist.py --archive --latest  # rip the newest airing (what CI runs)
+python3 morning_show_playlist.py --archive --recut   # re-cut a day already downloaded
 python3 morning_show_playlist.py --youtube           # studio tracks off YouTube instead
 ```
 
@@ -191,9 +192,41 @@ Both are gitignored.
 
 - **`--archive` slices the actual broadcast**, mapping each logged airdate to
   an offset in KEXP's ~2-week streaming archive and cutting with ffmpeg. Always
-  the right recording, but it's live radio: intros and outros can carry DJ
-  voiceover, and the logged airdate is approximate, so there's lead/tail
-  padding to keep songs from clipping. Only works inside the archive window.
+  the right recording, but it's live radio, so intros and outros carry DJ
+  voiceover. Only works inside the archive window.
+
+#### How the show is cut up
+
+The day is cut into a **contiguous partition**: each boundary is a single instant
+used as both the end of one track and the start of the next, so playing the
+folder through in order reproduces the broadcast exactly — nothing repeats and
+nothing is dropped. The first track absorbs the show's opening and the last runs
+to its end, so the whole airing is covered.
+
+This matters because the obvious approach doesn't work. Padding each song's
+window by a lead and a tail *independently* duplicates `lead + tail` seconds at
+every boundary — the two windows either side of a seam both claim that audio.
+The fix isn't a smaller pad; it's computing one boundary list for the show and
+deriving windows from it, so the duplication is unrepresentable.
+
+Boundaries sit at `airdate - shift`, where the DJ logs each play ~42s after the
+song actually starts. That lag varies by roughly ±14s, which this does not try to
+correct, so a cut can land a few seconds off the true seam — a song's first
+moments may sit at the tail of the previous track. Being *contiguous* is the
+guarantee; being exactly on the beat is not.
+
+One wrinkle the arithmetic can't ignore: the archive's mp3 chunks **overlap**. A
+show's chunk keeps running past the point where the next show's chunk begins, so
+the same minutes exist in both files. Boundaries therefore live on the broadcast
+wall-clock timeline rather than in any one file's offsets, and each window is
+mapped into whichever chunk actually contains it. Partitioning per file instead
+would duplicate that overlapping stretch — the same bug, one level down.
+
+`playlist.json` records each track's exact `start_offset`/`end_offset` plus the
+chunk it came from, so a day's cuts are auditable after the fact. Note that a
+re-run skips any mp3 already on disk, so **changing cut settings needs `--recut`**
+or the old cuts survive. CI is unaffected — it always starts from an empty
+`downloads/`.
 - **`--youtube` gets clean studio tracks** from the top search hit, and is
   strict — any track that fails to download exits non-zero. It does *not* work
   on CI: YouTube bot-blocks GitHub's datacenter IPs. That's why the nightly job

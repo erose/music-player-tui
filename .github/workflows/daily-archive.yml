@@ -33,10 +33,14 @@ jobs:
         run: |
           python3 --version
           ffmpeg -version | head -n 1   # informational; the install step above is the real guard
+          # ffprobe ships with the ffmpeg package and sets the last track's end
+          # boundary. Without it the ripper silently falls back to a capped
+          # duration and the show's tail gets cut short, so fail loudly instead.
+          ffprobe -version | head -n 1
 
       # Archive rip (reliable from CI). YouTube is bot-blocked on GitHub's
-      # datacenter IPs, so --youtube fails here; --archive slices from KEXP's
-      # broadcast with lead/tail padding so songs aren't clipped.
+      # datacenter IPs, so --youtube fails here; --archive cuts the broadcast
+      # into one contiguous partition, so the day plays through without repeats.
       - name: Rip the latest Morning Show from the KEXP archive
         run: python3 morning_show_playlist.py --archive --latest
 
