@@ -113,32 +113,32 @@ class TestComputeCuts(unittest.TestCase):
     """
 
     def test_windows_are_contiguous(self):
-        cuts = m.compute_cuts([100, 300, 500], 0.0, 700.0, shift=10)
+        cuts = m.compute_cuts([100, 300, 500], 0.0, 700.0, delay=10)
         for a, b in zip(cuts, cuts[1:]):
             self.assertEqual(a["end"], b["start"])   # one number, used twice
 
     def test_no_overlap_and_no_gap(self):
         # The regression this whole change exists for: the old code emitted a
         # constant lead+tail (23s) of duplicated audio at every boundary.
-        cuts = m.compute_cuts([100, 300, 500], 0.0, 700.0, shift=42)
+        cuts = m.compute_cuts([100, 300, 500], 0.0, 700.0, delay=37)
         for a, b in zip(cuts, cuts[1:]):
             self.assertEqual(b["start"] - a["end"], 0.0)
 
     def test_covers_the_whole_show(self):
-        cuts = m.compute_cuts([100, 300, 500], 0.0, 700.0, shift=42)
+        cuts = m.compute_cuts([100, 300, 500], 0.0, 700.0, delay=37)
         self.assertEqual(cuts[0]["start"], 0.0)      # show open folded into T1
         self.assertEqual(cuts[-1]["end"], 700.0)     # close folded into the last
         total = sum(c["end"] - c["start"] for c in cuts)
         self.assertAlmostEqual(total, 700.0)         # every second accounted for
 
-    def test_boundaries_use_shift(self):
-        cuts = m.compute_cuts([100, 300], 0.0, 700.0, shift=42)
-        self.assertEqual(cuts[1]["start"], 300 - 42)
+    def test_boundaries_use_delay(self):
+        cuts = m.compute_cuts([100, 300], 0.0, 700.0, delay=37)
+        self.assertEqual(cuts[1]["start"], 300 + 37)
 
     def test_out_of_order_airdate_merges_instead_of_dropping(self):
         # Second offset lands before the first boundary. The old code hit
         # `dur <= 0` and skipped the track, losing that audio entirely.
-        cuts = m.compute_cuts([100, 300, 200], 0.0, 700.0, shift=42)
+        cuts = m.compute_cuts([100, 300, 200], 0.0, 700.0, delay=37)
         self.assertEqual(cuts[1]["end"], cuts[1]["start"])       # collapsed
         for a, b in zip(cuts, cuts[1:]):
             self.assertEqual(a["end"], b["start"])               # still contiguous
@@ -146,13 +146,13 @@ class TestComputeCuts(unittest.TestCase):
 
     def test_boundaries_clamped_inside_the_show(self):
         # A wild offset can't push a window outside the show's span.
-        cuts = m.compute_cuts([100, 99999], 0.0, 700.0, shift=42)
+        cuts = m.compute_cuts([100, 99999], 0.0, 700.0, delay=37)
         for c in cuts:
             self.assertGreaterEqual(c["start"], 0.0)
             self.assertLessEqual(c["end"], 700.0)
 
     def test_empty(self):
-        self.assertEqual(m.compute_cuts([], 0.0, 700.0, shift=42), [])
+        self.assertEqual(m.compute_cuts([], 0.0, 700.0, delay=37), [])
 
 
 class TestDownloadArchive(unittest.TestCase):
@@ -164,9 +164,9 @@ class TestDownloadArchive(unittest.TestCase):
     A2 = "2026-07-28T07:08:01-07:00"
     A3 = "2026-07-28T07:11:38-07:00"
     FILE_DUR = 2500.0
-    # Expected boundaries as offsets in the chunk: show start, A2-shift,
-    # A3-shift, show end.
-    B0, B1, B2, B3 = 24.0, 1033.0, 1250.0, 2394.0
+    # Expected boundaries as offsets in the chunk: show start, A2+delay,
+    # A3+delay, show end.
+    B0, B1, B2, B3 = 24.0, 1112.0, 1329.0, 2394.0
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -263,9 +263,12 @@ class TestDownloadArchive(unittest.TestCase):
         mapping, tracks = self._standard()
         # Third track resolves into a LATER chunk that starts after the boundary
         # between tracks 2 and 3, so only the first chunk can supply that audio.
+        # A boundary can only precede the track's own chunk when it sits BEFORE
+        # the airdate, which the default (positive) delay never produces, so
+        # this pins a negative one to keep the fallback exercised.
         mapping[self.A3] = ("midday.mp3", 20)
         with self._patch_resolver(mapping), mock.patch("builtins.print"):
-            cuts = m.download_archive(tracks, self.START, self.END)
+            cuts = m.download_archive(tracks, self.START, self.END, delay=-42.0)
         wins = self._windows()
         # Every window still comes from a chunk that holds it, and consecutive
         # windows meet exactly — no repeated seconds across the chunk seam.

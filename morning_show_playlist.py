@@ -181,6 +181,13 @@ def write_manifest(path, program, host, date_str, tracks, cuts=None):
 # so ffmpeg can slice it out with a stream copy — no YouTube, no re-encode.
 
 STREAM_RESOLVER = "https://api.kexp.org/get_streaming_url/"
+# Where a song starts relative to its logged airdate, on the archive timeline
+# the resolver maps into. Positive: the song begins AFTER the airdate. Measured
+# 2026-10-20 by aligning repeat airings of the same recording (two broadcasts
+# match only while the song plays): John Richards' Morning Show sat at a median
+# of +37s on every day measured, songs mostly within ±4s. The old value was
+# `airdate - 42`, which cut ~79s early. Other hosts measured +18..+40s.
+START_DELAY_SEC = 37.0
 # A window this short means its boundaries collapsed (duplicate/out-of-order
 # airdates); there's no audio worth writing, so we report it instead.
 MIN_TRACK_SEC = 1.0
@@ -226,7 +233,7 @@ def probe_duration(target):
         return None
 
 
-def compute_cuts(times, start_anchor, end_anchor, shift):
+def compute_cuts(times, start_anchor, end_anchor, delay):
     """Partition [start_anchor, end_anchor] into one contiguous window per track.
 
     Returns [{"start", "end"}] where window i's end is EXACTLY window i+1's start
@@ -240,19 +247,21 @@ def compute_cuts(times, start_anchor, end_anchor, shift):
     per file would therefore duplicate the overlapping stretch — the exact bug
     this function exists to prevent.
 
-    Boundaries sit at `time - shift`: the DJ logs each play ~shift seconds after
-    the song actually starts, with ~14s of variation that this doesn't try to
-    correct, so a cut can sit a few seconds off the true seam. It lands in the
-    adjacent track rather than being duplicated or lost. The first window begins
-    at `start_anchor` and the last ends at `end_anchor`, so the show's open and
-    close land in the adjacent tracks instead of falling outside the partition.
+    Boundaries sit at `time + delay`: on the archive's timeline a song starts
+    ~delay seconds AFTER its logged airdate (see START_DELAY_SEC). The true
+    delay varies a few seconds per song and more between hosts, which this
+    doesn't try to correct, so a cut can sit a few seconds off the true seam.
+    It lands in the adjacent track rather than being duplicated or lost. The
+    first window begins at `start_anchor` and the last ends at `end_anchor`, so
+    the show's open and close land in the adjacent tracks instead of falling
+    outside the partition.
     """
     n = len(times)
     if n == 0:
         return []
     end_anchor = max(end_anchor, start_anchor)
 
-    bounds = [start_anchor] + [t - shift for t in times[1:]] + [end_anchor]
+    bounds = [start_anchor] + [t + delay for t in times[1:]] + [end_anchor]
 
     # Keep every boundary inside the show, then force the list non-decreasing.
     # A duplicate or out-of-order airdate then collapses its own window to zero
@@ -267,7 +276,7 @@ def compute_cuts(times, start_anchor, end_anchor, shift):
 
 
 def download_archive(tracks, start_iso, end_iso, bitrate=256, location=3,
-                     shift=42.0, recut=False):
+                     delay=None, recut=False):
     """Rip the show from the KEXP archive as one 'Artist - Song.mp3' per track.
 
     Resolves each play to a (chunk URL, in-file offset), partitions the show into
@@ -333,7 +342,9 @@ def download_archive(tracks, start_iso, end_iso, bitrate=256, location=3,
                 return u, entry
         return url, chunks.get(url)
 
-    windows = compute_cuts([inf[3] for inf in infos], show_start, show_end, shift)
+    if delay is None:
+        delay = START_DELAY_SEC
+    windows = compute_cuts([inf[3] for inf in infos], show_start, show_end, delay)
 
     cuts = {}
     ok, failed, skipped, done, clipped = 0, [], 0, 0, []

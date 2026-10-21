@@ -209,11 +209,16 @@ every boundary — the two windows either side of a seam both claim that audio.
 The fix isn't a smaller pad; it's computing one boundary list for the show and
 deriving windows from it, so the duplication is unrepresentable.
 
-Boundaries sit at `airdate - shift`, where the DJ logs each play ~42s after the
-song actually starts. That lag varies by roughly ±14s, which this does not try to
-correct, so a cut can land a few seconds off the true seam — a song's first
-moments may sit at the tail of the previous track. Being *contiguous* is the
-guarantee; being exactly on the beat is not.
+Boundaries sit at `airdate + delay`: on the archive's timeline (the one the
+resolver's offsets live on) a song starts ~37s *after* its logged airdate. That
+was measured by aligning repeat airings of the same recording — two broadcasts
+match only while the song is playing, so where they start matching is the true
+start. John Richards' shows sat at a median of +37s on every day measured, most
+songs within ±4s; other hosts ranged from about +18s to +40s. The previous
+placement, `airdate - 42`, cut ~79s early, so each track opened with the end of
+whatever preceded it. A cut can still land a few seconds off the true seam —
+more on a fill-in host's day. Being *contiguous* is the guarantee; being
+exactly on the beat is not.
 
 One wrinkle the arithmetic can't ignore: the archive's mp3 chunks **overlap**. A
 show's chunk keeps running past the point where the next show's chunk begins, so
