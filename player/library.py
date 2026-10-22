@@ -137,10 +137,13 @@ class Library:
             key = present.get(name, f"{day.prefix}/{name}")
             day.tracks.append(
                 Track(
-                    artist=entry.get("artist", ""),
-                    song=entry.get("song", ""),
-                    album=entry.get("album", ""),
-                    airdate=entry.get("airdate", ""),
+                    # The ripper writes null, not a missing key, when KEXP
+                    # has no album or airdate for a play, so `or ""` rather
+                    # than a .get() default.
+                    artist=entry.get("artist") or "",
+                    song=entry.get("song") or "",
+                    album=entry.get("album") or "",
+                    airdate=entry.get("airdate") or "",
                     filename=name,
                     key=key,
                     # A playlist entry with no matching object would 404 at

@@ -78,6 +78,19 @@ class PlaylistPresent(unittest.TestCase):
         self.assertEqual(day.tracks[1].album, "Burn the Maps")
         self.assertEqual(day.tracks[0].airdate, "2026-07-31T07:05:28-07:00")
 
+    def test_null_album_and_airdate_become_empty_strings(self):
+        """The ripper writes null, not a missing key, when KEXP has no album
+        or airdate for a play. Track promises strings, and the table calls
+        len() on them."""
+        playlist = json.loads(json.dumps(PLAYLIST))
+        playlist["tracks"][0]["album"] = None
+        playlist["tracks"][0]["airdate"] = None
+        library = StubLibrary(json.dumps(playlist).encode())
+        day = library.load_day(a_day())
+
+        self.assertEqual(day.tracks[0].album, "")
+        self.assertEqual(day.tracks[0].airdate, "")
+
     def test_a_second_load_does_not_refetch(self):
         library = StubLibrary(json.dumps(PLAYLIST).encode())
         day = library.load_day(a_day())
